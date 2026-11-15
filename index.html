@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#0f4c81">
   <link rel="manifest" href="manifest.json">
-  <link rel="icon" type="image/png" href="icon-192.png">
-  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="icon" href="icons/icono_192.png">
+  <link rel="apple-touch-icon" href="icons/icono_512.png">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Reportes">
@@ -86,6 +86,9 @@
     }
     .btn-file:hover { border-color: var(--primary); color: var(--primary); }
     input[type="file"] { display: none; }
+    .check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; margin: 0; color: var(--text-main); }
+    .check input { width: 20px; height: 20px; margin-top: 2px; flex-shrink: 0; }
+    #collagePreview { display: none; width: 100%; margin-top: 10px; border-radius: 6px; border: 1px solid var(--border-color); }
     .photo-count { font-size: 0.8rem; color: var(--secondary); margin-top: 8px; }
 
     .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(85px, 1fr)); gap: 10px; margin-top: 10px; }
@@ -218,6 +221,11 @@
           <input type="file" id="photoInput" accept="image/*" multiple>
           <div class="photo-grid" id="photoGrid"></div>
           <div class="photo-count" id="photoCount"></div>
+          <div id="collageBox" style="display:none; margin-top:14px;">
+            <label class="check"><input type="checkbox" id="collageToggle" checked><span>Unir las fotos en un collage (se envía como una sola imagen)</span></label>
+            <div class="photo-count" id="collageStatus"></div>
+            <img id="collagePreview" alt="Vista previa del collage">
+          </div>
         </div>
 
         <button type="button" class="btn btn-primary" id="btnGenerar">Generar reporte</button>
@@ -386,6 +394,7 @@
       const n = photos.length;
       $('photoCount').textContent = n ? `${n} fotografía${n === 1 ? '' : 's'} adjunta${n === 1 ? '' : 's'}` : '';
       updateShareHint();
+      rebuildCollage();
     }
 
     function clearPhotos() {
@@ -394,6 +403,110 @@
       photoSeq = 0;
       renderPhotoGrid();
     }
+
+    // ---------- Collage ----------
+    let collageOn = true;
+    let collageState = 'off';      // 'off' | 'building' | 'ready' | 'failed'
+    let collageFile = null;
+    let collageUrl = null;
+    let collageToken = 0;
+
+    async function loadDrawable(file) {
+      if (window.createImageBitmap) {
+        try {
+          const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+          return { src: bmp, w: bmp.width, h: bmp.height, release: () => { if (bmp.close) bmp.close(); } };
+        } catch (e) {}
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return { src: img, w: img.naturalWidth, h: img.naturalHeight, release: () => URL.revokeObjectURL(url) };
+    }
+
+    // Distribución: 2 fotos lado a lado, 3-4 en 2 columnas, 5 o más en 3 columnas.
+    // La última fila se reparte el ancho completo. La celda es vertical u horizontal según predominen las fotos.
+    function collageLayout(n, W, gap, portrait) {
+      const cols = n <= 2 ? n : (n <= 4 ? 2 : 3);
+      const rows = Math.ceil(n / cols);
+      const rowH = Math.round((W - (cols - 1) * gap) / cols * (portrait ? 4 / 3 : 3 / 4));
+      const cells = [];
+      let i = 0;
+      for (let r = 0; r < rows; r++) {
+        const inRow = Math.min(cols, n - i);
+        const cw = (W - (inRow - 1) * gap) / inRow;
+        for (let c = 0; c < inRow; c++) { cells.push({ x: c * (cw + gap), y: r * (rowH + gap), w: cw, h: rowH }); i++; }
+      }
+      return { cells, H: rows * rowH + (rows - 1) * gap };
+    }
+
+    function setCollageStatus(msg) { $('collageStatus').textContent = msg; }
+
+    async function rebuildCollage() {
+      const token = ++collageToken;
+      $('collageBox').style.display = photos.length >= 2 ? 'block' : 'none';
+      collageFile = null;
+      if (collageUrl) { URL.revokeObjectURL(collageUrl); collageUrl = null; }
+      $('collagePreview').style.display = 'none';
+      $('collagePreview').removeAttribute('src');
+
+      if (photos.length < 2 || !collageOn) {
+        collageState = 'off';
+        setCollageStatus('');
+        updateShareHint();
+        return;
+      }
+
+      collageState = 'building';
+      setCollageStatus('Creando collage...');
+      updateShareHint();
+
+      const items = [];
+      try {
+        for (const ph of photos) {
+          const d = await loadDrawable(ph.file);
+          items.push(d);
+          if (token !== collageToken) return;       // cambió algo mientras se procesaba
+        }
+        const portraitCount = items.filter(d => d.h > d.w).length;
+        const W = 1800, gap = 8;
+        const { cells, H } = collageLayout(items.length, W, gap, portraitCount > items.length / 2);
+        const canvas = document.createElement('canvas');
+        canvas.width = W; canvas.height = H;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, W, H);
+        items.forEach((d, i) => {
+          const c = cells[i];
+          const scale = Math.max(c.w / d.w, c.h / d.h);          // recorta para llenar la celda
+          const sw = c.w / scale, sh = c.h / scale;
+          ctx.drawImage(d.src, (d.w - sw) / 2, (d.h - sh) / 2, sw, sh, c.x, c.y, c.w, c.h);
+        });
+        const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+        canvas.width = canvas.height = 0;
+        if (token !== collageToken) return;
+        if (!blob) throw new Error('sin imagen');
+        collageFile = new File([blob], 'collage.jpg', { type: 'image/jpeg', lastModified: Date.now() });
+        collageUrl = URL.createObjectURL(collageFile);
+        $('collagePreview').src = collageUrl;
+        $('collagePreview').style.display = 'block';
+        collageState = 'ready';
+        setCollageStatus('Collage listo: se enviará como una sola imagen.');
+      } catch (e) {
+        if (token !== collageToken) return;
+        collageState = 'failed';
+        setCollageStatus('No se pudo crear el collage; se enviarán las fotos por separado.');
+      } finally {
+        items.forEach(d => { try { d.release(); } catch (e) {} });
+        if (token === collageToken) updateShareHint();
+      }
+    }
+
+    $('collageToggle').addEventListener('change', (e) => {
+      collageOn = e.target.checked;
+      rebuildCollage();
+    });
 
     // ---------- Reporte (formato original) ----------
     function buildReport() {
@@ -461,7 +574,9 @@ Estatus del equipo: ${estatus}`;
 
     function updateShareHint() {
       $('shareHint').textContent = photos.length
-        ? 'Con fotos: se usa el menú de compartir del teléfono. Si no responde, use «Enviar solo texto».'
+        ? (collageState === 'ready' || collageState === 'building'
+            ? 'Con collage: se usa el menú de compartir del teléfono y se envía una sola imagen. Si no responde, use «Enviar solo texto».'
+            : 'Con fotos: se usa el menú de compartir del teléfono. Si no responde, use «Enviar solo texto».')
         : 'Sin fotos: se abre WhatsApp directamente con el texto.';
     }
 
@@ -551,6 +666,12 @@ Estatus del equipo: ${estatus}`;
       // Con fotos: se cancela el enlace y se usa el menú de compartir.
       e.preventDefault();
 
+      if (collageState === 'building') {
+        setStatus('Toque ' + n + ': el collage aún se está creando, intente de nuevo en un momento.');
+        showToast('Creando el collage... intente de nuevo en un momento', 3000);
+        return;
+      }
+
       if (typeof navigator.share !== 'function' || typeof navigator.canShare !== 'function') {
         setStatus('Toque ' + n + ': este navegador no tiene menú de compartir (¿página abierta como archivo local?). Se abrió WhatsApp con el texto.');
         showToast('Este navegador no puede adjuntar fotos. Se envía solo el texto.', 3500);
@@ -559,7 +680,8 @@ Estatus del equipo: ${estatus}`;
       }
 
       // Archivos nuevos en cada intento, para no reutilizar objetos ya consumidos por un envío anterior.
-      const files = photos.map(ph => new File([ph.file], ph.file.name, { type: ph.file.type, lastModified: Date.now() }));
+      const sources = (collageState === 'ready' && collageFile) ? [collageFile] : photos.map(ph => ph.file);
+      const files = sources.map(f => new File([f], f.name, { type: f.type, lastModified: Date.now() }));
       const data = { text, files };
 
       let can = false;
@@ -616,11 +738,9 @@ Estatus del equipo: ${estatus}`;
     clearDraft();   // cada vez que se abre el archivo empieza un reporte nuevo
     updateShareHint();
 
-    // ---------- PWA: service worker (necesario para poder instalar la app) ----------
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW no registrado:', err));
-      });
+    // ---------- Instalación / uso sin internet (PWA) ----------
+    if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
     }
   </script>
 </body>
